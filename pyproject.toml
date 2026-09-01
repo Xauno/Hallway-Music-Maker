@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hallway-music-maker"
+version = "0.1.0"
+description = "Create randomized MP3 combos from a Spotify playlist."
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv>=1.0.0",
+    "spotipy>=2.24.0",
+    "yt-dlp>=2025.1.15",
+]
+
+[project.scripts]
+hallway-music-maker = "hallway_music_maker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
