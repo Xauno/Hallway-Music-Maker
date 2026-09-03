@@ -15,6 +15,7 @@ import spotipy
 from dotenv import load_dotenv
 
 from .pipeline import create_combo
+from .state import reset_all_used_ids, save_used_ids
 
 
 def playlist_id(value: str) -> str:
@@ -34,13 +35,20 @@ def track_ids(value: str) -> list[str]:
 
 
 def resolve_ffmpeg(value: str) -> str:
-    if shutil.which(value) or Path(value).is_file():
-        return value
+    resolved = shutil.which(value)
+    if resolved:
+        return str(Path(resolved).resolve())
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
     if value == "ffmpeg":
         package_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
         matches = sorted(package_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
         if matches:
-            return str(matches[-1])
+            return str(matches[-1].resolve())
+        for candidate in (Path("/opt/homebrew/bin/ffmpeg"), Path("/usr/local/bin/ffmpeg")):
+            if candidate.is_file():
+                return str(candidate.resolve())
     return value
 
 
@@ -84,12 +92,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="Select tracks without downloading or changing state")
     parser.add_argument("--seed", type=int, help="Seed selection for reproducible dry runs")
+    parser.add_argument(
+        "--reset-used",
+        action="store_true",
+        help="Clear the used-track list for --playlist and exit",
+    )
     return parser
 
 
 def main() -> int:
     load_dotenv()
     args = build_parser().parse_args()
+    if args.reset_used:
+        if not args.playlist:
+            print("--reset-used requires --playlist.", file=sys.stderr)
+            return 2
+        selected_playlist_id = playlist_id(args.playlist)
+        if selected_playlist_id.lower() == "all":
+            reset_all_used_ids(args.state)
+            print("Reset used tracks for all playlists.")
+        else:
+            save_used_ids(args.state, selected_playlist_id, set())
+            print(f"Reset used tracks for playlist {selected_playlist_id}.")
+        return 0
     if not args.playlist and not args.dry_run:
         try:
             combo_count = int(input("How many combos would you like to make? [1]: ").strip() or "1")
@@ -104,6 +129,17 @@ def main() -> int:
         if wants_extras in {"y", "yes"}:
             extra_value = input("Spotify track URLs or IDs, separated by commas: ").strip()
             extra_track_ids = track_ids(extra_value) if extra_value else []
+            if extra_track_ids:
+                if len(extra_track_ids) > combo_count:
+                    skipped_count = len(extra_track_ids) - combo_count
+                    proceed = input(
+                        f"Warning: {len(extra_track_ids)} custom songs were entered for {combo_count} "
+                        f"combos. {skipped_count} custom song(s) will be skipped. Proceed? [y/N]: "
+                    ).strip().lower()
+                    if proceed not in {"y", "yes"}:
+                        print("Cancelled because some custom songs would be skipped.", file=sys.stderr)
+                        return 2
+                random.shuffle(extra_track_ids)
     else:
         combo_count = 1
         extra_track_ids = []
@@ -187,6 +223,11 @@ def main() -> int:
                 rng=random.Random(args.seed + combo_number - 1) if args.seed is not None else random.Random(),
                 dry_run=args.dry_run,
                 extra_track_ids=extra_track_ids,
+                priority_track_id=(
+                    extra_track_ids[combo_number - 1]
+                    if combo_number <= len(extra_track_ids)
+                    else None
+                ),
                 execution_used_ids=execution_used_ids,
             )
             if not args.dry_run:

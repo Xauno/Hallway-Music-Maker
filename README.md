@@ -1,6 +1,6 @@
 # Hallway Music Maker
 
-Creates a randomized MP3 combo from a Spotify playlist. Each successful combo is trimmed to 12 minutes by default, and its selected Spotify track IDs are stored under that playlist's ID in `data/used_tracks.json` so they are not selected again for that playlist.
+Creates a randomized MP3 combo from a Spotify playlist. Each successful combo is trimmed to 12 minutes by default, and its selected Spotify track IDs are stored under that playlist's ID in `data/used_tracks.json` so they are not selected again for that playlist. If a combo exceeds length set minus two minutes (10 minutes for the 12 minute default) then it will not add another song. This is to prevent a song getting cut off when it just starts.
 
 ## Requirements
 
@@ -38,7 +38,7 @@ For the short interactive mode, activate the environment and run the command wit
 hallway-music-maker
 ```
 
-It asks how many combos to make, whether you want to add custom Spotify tracks, and the combo length. If the custom tracks alone cover the requested duration for every combo, it does not ask for a playlist. Otherwise, it asks for the playlist link. Press Enter at the length prompt to use 12 minutes. It uses Firefox cookies by default, and the output is automatically named `output\\MM,DD-N.mp3`, where `N` is the next combo made that day.
+It asks how many combos to make, whether you want to add custom Spotify tracks, and the combo length. Custom tracks are shuffled once and assigned one per combo, with the assigned track placed first. If more custom tracks are entered than combos, it warns that the extras will be skipped and asks whether to proceed. If the custom tracks alone cover the requested duration for every combo, it does not ask for a playlist. Otherwise, it asks for the playlist link. Press Enter at the length prompt to use 12 minutes. It uses Firefox cookies by default, and the output is automatically named `output\\MM,DD-N.mp3`, where `N` is the next combo made that day.
 
 Preview the next selection without downloading or changing the used list:
 
@@ -52,6 +52,20 @@ Create the combo:
 hallway-music-maker --playlist PLAYLIST_ID
 ```
 
+Reset the used-track list for one playlist without creating a combo:
+
+```powershell
+hallway-music-maker --playlist PLAYLIST_ID --reset-used
+```
+
+This clears only that playlist's entries in `data/used_tracks.json` and preserves used tracks for other playlists.
+
+Reset the used-track lists for every playlist:
+
+```powershell
+hallway-music-maker --playlist all --reset-used
+```
+
 Useful options:
 
 - `--target-minutes 12` changes the output length.
@@ -60,6 +74,8 @@ Useful options:
 - `--work-dir .downloads` changes temporary download storage.
 - `--cookies-from-browser chrome` uses a logged-in browser session when YouTube returns HTTP 403. Use `edge`, `firefox`, or `brave` as appropriate.
 - `--seed 42` makes selection reproducible.
+
+Each combo uses its own temporary subdirectory under the work directory, so simultaneous or interrupted runs do not reuse another combo's download filenames.
 
 The used list is updated only after the final MP3 is created. Tracks are tracked separately for each playlist, so using a different playlist does not exclude tracks used by another playlist. To start over, delete `data/used_tracks.json`.
 

@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,11 @@ from yt_dlp import YoutubeDL
 from .state import load_used_ids, save_used_ids
 
 SELECTION_BUFFER_SECONDS = 120
+
+
+def concat_file_path(path: Path) -> str:
+    escaped = path.resolve().as_posix().replace("\\", "\\\\").replace("'", "'\\''")
+    return f"file '{escaped}'"
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,7 @@ def download_path(work_dir: Path, index: int, track: Track) -> Path:
 
 def playlist_tracks(spotify: Any, playlist_id: str) -> list[Track]:
     tracks: list[Track] = []
+    seen_pages: set[str] = set()
     try:
         results = spotify.playlist_items(
             playlist_id,
@@ -60,6 +67,11 @@ def playlist_tracks(spotify: Any, playlist_id: str) -> list[Track]:
             ) from exc
         raise
     while results:
+        page_url = results.get("href") or results.get("next")
+        if page_url and page_url in seen_pages:
+            raise RuntimeError("Spotify returned the same playlist page more than once.")
+        if page_url:
+            seen_pages.add(page_url)
         for item in results.get("items", []):
             track = item.get("track") or {}
             track_id = track.get("id")
@@ -88,7 +100,7 @@ def choose_tracks(
     rng: random.Random,
     shuffle_tracks: bool = True,
 ) -> list[Track]:
-    available = [track for track in tracks if track.id not in used_ids]
+    available = [track for track in tracks if track.id not in used_ids and track.duration_ms > 0]
     if shuffle_tracks:
         rng.shuffle(available)
     chosen: list[Track] = []
@@ -124,12 +136,21 @@ def merge_mp3s(files: list[Path], output: Path, target_seconds: int, ffmpeg: str
     if missing:
         names = ", ".join(str(file) for file in missing)
         raise RuntimeError(f"Downloaded file disappeared before merging: {names}")
-    concat_file = output.parent / f".{output.stem}.concat.txt"
-    concat_file.write_text(
-        "\n".join(f"file '{file.resolve().as_posix().replace(chr(39), chr(39) + chr(39))}'" for file in files)
-        + "\n",
+    with tempfile.NamedTemporaryFile(
+        "w",
         encoding="utf-8",
-    )
+        dir=output.parent,
+        prefix=f".{output.stem}.",
+        suffix=".concat.txt",
+        delete=False,
+    ) as concat:
+        concat.write(
+            "\n".join(
+                concat_file_path(file) for file in files
+            )
+            + "\n"
+        )
+        concat_file = Path(concat.name)
     try:
         command = [
             ffmpeg,
@@ -174,6 +195,7 @@ def create_combo(
     rng: random.Random | None = None,
     dry_run: bool = False,
     extra_track_ids: list[str] | None = None,
+    priority_track_id: str | None = None,
     execution_used_ids: set[str] | None = None,
 ) -> list[Track]:
     rng = rng or random.Random()
@@ -195,11 +217,13 @@ def create_combo(
             )
         except Exception as exc:
             print(f"Skipping additional track {track_id}: {exc}")
-    all_tracks.extend(extra_tracks)
     extra_ids = {track.id for track in extra_tracks}
+    selected_extra_ids = {priority_track_id} if priority_track_id in extra_ids else set()
+    all_tracks.extend(track for track in extra_tracks if track.id in selected_extra_ids)
+    priority_ids = selected_extra_ids
     if dry_run:
-        used_ids = load_used_ids(state_path, playlist_id) | execution_used_ids
-        ordered_tracks = prioritize_tracks(all_tracks, used_ids, extra_ids, rng)
+        used_ids = (load_used_ids(state_path, playlist_id) | execution_used_ids) - priority_ids
+        ordered_tracks = prioritize_tracks(all_tracks, used_ids, priority_ids, rng)
         chosen = choose_tracks(
             ordered_tracks,
             set(),
@@ -212,12 +236,18 @@ def create_combo(
             print(f"  - {track.label}")
         return chosen
     work_dir.mkdir(parents=True, exist_ok=True)
+    combo_work_dir = Path(tempfile.mkdtemp(prefix=f".{output.stem}.", dir=work_dir))
     downloads: list[Path] = []
     chosen: list[Track] = []
     total_seconds = 0.0
     selection_target_seconds = max(target_seconds - SELECTION_BUFFER_SECONDS, 1)
     used_ids = load_used_ids(state_path, playlist_id)
-    available = prioritize_tracks(all_tracks, used_ids | execution_used_ids, extra_ids, rng)
+    available = prioritize_tracks(
+        all_tracks,
+        (used_ids | execution_used_ids) - priority_ids,
+        priority_ids,
+        rng,
+    )
     warned_low = False
     attempted_until = 0
     try:
@@ -229,7 +259,7 @@ def create_combo(
                 warned_low = True
             print(f"Downloading {index}/{len(available)}: {track.label}")
             try:
-                destination = download_path(work_dir, index, track)
+                destination = download_path(combo_work_dir, index, track)
                 download_track(track, destination, ffmpeg, cookies_from_browser)
             except (OSError, RuntimeError) as exc:
                 print(f"Skipping {track.label}: {exc}")
@@ -255,7 +285,7 @@ def create_combo(
             for index, track in enumerate(available[attempted_until:], start=attempted_until + 1):
                 print(f"Downloading replacement {index}/{len(available)}: {track.label}")
                 try:
-                    destination = download_path(work_dir, index, track)
+                    destination = download_path(combo_work_dir, index, track)
                     download_track(track, destination, ffmpeg, cookies_from_browser)
                 except (OSError, RuntimeError) as exc:
                     print(f"Skipping {track.label}: {exc}")
@@ -283,7 +313,12 @@ def create_combo(
                 downloads.clear()
                 chosen.clear()
                 total_seconds = 0.0
-                available = prioritize_tracks(all_tracks, execution_used_ids, extra_ids, rng)
+                available = prioritize_tracks(
+                    all_tracks,
+                    execution_used_ids - priority_ids,
+                    priority_ids,
+                    rng,
+                )
                 warned_low = False
                 for index, track in enumerate(available, start=1):
                     remaining = len(available) - index
@@ -292,7 +327,7 @@ def create_combo(
                         warned_low = True
                     print(f"Downloading {index}/{len(available)}: {track.label}")
                     try:
-                        destination = download_path(work_dir, index, track)
+                        destination = download_path(combo_work_dir, index, track)
                         download_track(track, destination, ffmpeg, cookies_from_browser)
                     except (OSError, RuntimeError) as exc:
                         print(f"Skipping {track.label}: {exc}")
@@ -318,6 +353,7 @@ def create_combo(
     finally:
         for download in downloads:
             download.unlink(missing_ok=True)
+        shutil.rmtree(combo_work_dir, ignore_errors=True)
 
 
 def download_track(
@@ -328,12 +364,22 @@ def download_track(
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.unlink(missing_ok=True)
-    if not shutil.which(ffmpeg) and not Path(ffmpeg).is_file() and ffmpeg == "ffmpeg":
+    resolved = shutil.which(ffmpeg)
+    if resolved:
+        ffmpeg = str(Path(resolved).resolve())
+    elif Path(ffmpeg).is_file():
+        ffmpeg = str(Path(ffmpeg).resolve())
+    elif ffmpeg == "ffmpeg":
         package_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
         matches = sorted(package_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
         if matches:
-            ffmpeg = str(matches[-1])
-    if not shutil.which(ffmpeg) and not Path(ffmpeg).is_file():
+            ffmpeg = str(matches[-1].resolve())
+        else:
+            for candidate in (Path("/opt/homebrew/bin/ffmpeg"), Path("/usr/local/bin/ffmpeg")):
+                if candidate.is_file():
+                    ffmpeg = str(candidate.resolve())
+                    break
+    if not Path(ffmpeg).is_file() and not shutil.which(ffmpeg):
         raise RuntimeError(f"FFmpeg was not found at '{ffmpeg}'. Exiting.")
     template = str(destination.with_suffix("")) + ".%(ext)s"
     options = {

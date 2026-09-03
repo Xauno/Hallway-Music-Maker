@@ -45,3 +45,11 @@ def save_used_ids(path: Path, playlist_id: str, used_ids: set[str]) -> None:
         temp.write(payload)
         temporary_path = Path(temp.name)
     os.replace(temporary_path, path)
+
+
+def reset_all_used_ids(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as temp:
+        temp.write("{}\n")
+        temporary_path = Path(temp.name)
+    os.replace(temporary_path, path)
