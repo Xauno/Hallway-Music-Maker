@@ -7,15 +7,17 @@ from datetime import date, datetime
 import os
 import random
 import re
-import shutil
 import sys
 from pathlib import Path
 
 import spotipy
 from dotenv import load_dotenv
 
-from .pipeline import create_combo
+from .pipeline import Track, create_combo, fetch_tracks, playlist_tracks, resolve_ffmpeg, selection_target
 from .state import reset_all_used_ids, save_used_ids
+
+CUSTOM_ONLY_KEY = "__custom__"
+OUTPUT_DIR = Path("output")
 
 
 def playlist_id(value: str) -> str:
@@ -34,26 +36,11 @@ def track_ids(value: str) -> list[str]:
     return ids
 
 
-def resolve_ffmpeg(value: str) -> str:
-    resolved = shutil.which(value)
-    if resolved:
-        return str(Path(resolved).resolve())
-    candidate = Path(value).expanduser()
-    if candidate.is_file():
-        return str(candidate.resolve())
-    if value == "ffmpeg":
-        package_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
-        matches = sorted(package_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
-        if matches:
-            return str(matches[-1].resolve())
-        for candidate in (Path("/opt/homebrew/bin/ffmpeg"), Path("/usr/local/bin/ffmpeg")):
-            if candidate.is_file():
-                return str(candidate.resolve())
-    return value
-
-
-def ffmpeg_available(value: str) -> bool:
-    return shutil.which(value) is not None or Path(value).is_file()
+def custom_songs_cover_combos(custom_seconds: list[float], combo_count: int, target_seconds: float) -> bool:
+    """Each combo gets one custom song, so every combo needs its own song long enough to fill it."""
+    required = selection_target(target_seconds)
+    assigned = custom_seconds[:combo_count]
+    return len(assigned) == combo_count and all(seconds >= required for seconds in assigned)
 
 
 def next_combo_path(output_dir: Path, today: date | None = None) -> Path:
@@ -68,12 +55,54 @@ def next_combo_path(output_dir: Path, today: date | None = None) -> Path:
     return output_dir / f"{prefix}-{max(numbers, default=0) + 1}.mp3"
 
 
-def write_execution_log(path: Path, combos: list[tuple[Path, list]]) -> None:
+def combo_output_path(requested: Path | None, combo_number: int, combo_count: int) -> Path:
+    if requested is None:
+        return next_combo_path(OUTPUT_DIR)
+    if combo_count > 1:
+        return requested.with_name(f"{requested.stem}-{combo_number}{requested.suffix}")
+    return requested
+
+
+def write_execution_log(path: Path, combos: list[tuple[Path, list[Track]]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     sections = []
     for output, tracks in combos:
         sections.append("\n".join([f"[{output.name}]"] + [f"[{track.label}]" for track in tracks]))
     path.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
+
+
+def ask_yes(prompt: str) -> bool:
+    return input(prompt).strip().lower() in {"y", "yes"}
+
+
+def fail(message: str) -> int:
+    print(message, file=sys.stderr)
+    return 2
+
+
+def prompt_combo_setup() -> tuple[int, list[str]] | None:
+    """Ask for the combo count and optional custom songs; returns None if the user input is invalid or cancelled."""
+    try:
+        combo_count = int(input("How many combos would you like to make? [1]: ").strip() or "1")
+    except ValueError:
+        fail("The number of combos must be a whole number.")
+        return None
+    if combo_count <= 0:
+        fail("The number of combos must be greater than zero.")
+        return None
+    extra_track_ids: list[str] = []
+    if ask_yes("Do you want to add additional songs? [y/N]: "):
+        extra_track_ids = track_ids(input("Spotify track URLs or IDs, separated by commas: ").strip())
+        if len(extra_track_ids) > combo_count:
+            skipped_count = len(extra_track_ids) - combo_count
+            if not ask_yes(
+                f"Warning: {len(extra_track_ids)} custom songs were entered for {combo_count} "
+                f"combos. {skipped_count} custom song(s) will be skipped. Proceed? [y/N]: "
+            ):
+                fail("Cancelled because some custom songs would be skipped.")
+                return None
+        random.shuffle(extra_track_ids)
+    return combo_count, extra_track_ids
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,72 +129,45 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def reset_used(args: argparse.Namespace) -> int:
+    if not args.playlist:
+        return fail("--reset-used requires --playlist.")
+    selected_playlist_id = playlist_id(args.playlist)
+    if selected_playlist_id.lower() == "all":
+        reset_all_used_ids(args.state)
+        print("Reset used tracks for all playlists.")
+    else:
+        save_used_ids(args.state, selected_playlist_id, set())
+        print(f"Reset used tracks for playlist {selected_playlist_id}.")
+    return 0
+
+
 def main() -> int:
     load_dotenv()
     args = build_parser().parse_args()
     if args.reset_used:
-        if not args.playlist:
-            print("--reset-used requires --playlist.", file=sys.stderr)
-            return 2
-        selected_playlist_id = playlist_id(args.playlist)
-        if selected_playlist_id.lower() == "all":
-            reset_all_used_ids(args.state)
-            print("Reset used tracks for all playlists.")
-        else:
-            save_used_ids(args.state, selected_playlist_id, set())
-            print(f"Reset used tracks for playlist {selected_playlist_id}.")
-        return 0
+        return reset_used(args)
+    combo_count, extra_track_ids = 1, []
     if not args.playlist and not args.dry_run:
-        try:
-            combo_count = int(input("How many combos would you like to make? [1]: ").strip() or "1")
-        except ValueError:
-            print("The number of combos must be a whole number.", file=sys.stderr)
+        setup = prompt_combo_setup()
+        if setup is None:
             return 2
-        if combo_count <= 0:
-            print("The number of combos must be greater than zero.", file=sys.stderr)
-            return 2
-        extra_track_ids = []
-        wants_extras = input("Do you want to add additional songs? [y/N]: ").strip().lower()
-        if wants_extras in {"y", "yes"}:
-            extra_value = input("Spotify track URLs or IDs, separated by commas: ").strip()
-            extra_track_ids = track_ids(extra_value) if extra_value else []
-            if extra_track_ids:
-                if len(extra_track_ids) > combo_count:
-                    skipped_count = len(extra_track_ids) - combo_count
-                    proceed = input(
-                        f"Warning: {len(extra_track_ids)} custom songs were entered for {combo_count} "
-                        f"combos. {skipped_count} custom song(s) will be skipped. Proceed? [y/N]: "
-                    ).strip().lower()
-                    if proceed not in {"y", "yes"}:
-                        print("Cancelled because some custom songs would be skipped.", file=sys.stderr)
-                        return 2
-                random.shuffle(extra_track_ids)
-    else:
-        combo_count = 1
-        extra_track_ids = []
+        combo_count, extra_track_ids = setup
     if args.target_minutes is None:
         length = input("Finished MP3 length in minutes [12]: ").strip()
         try:
             args.target_minutes = float(length) if length else 12.0
         except ValueError:
-            print("Length must be a number of minutes.", file=sys.stderr)
-            return 2
-    requested_output = args.output
-    required = ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET")
-    missing = [name for name in required if not os.getenv(name)]
+            return fail("Length must be a number of minutes.")
+    missing = [name for name in ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET") if not os.getenv(name)]
     if missing:
-        print(f"Missing environment variable(s): {', '.join(missing)}", file=sys.stderr)
-        return 2
+        return fail(f"Missing environment variable(s): {', '.join(missing)}")
     if args.target_minutes <= 0:
-        print("--target-minutes must be greater than zero", file=sys.stderr)
-        return 2
+        return fail("--target-minutes must be greater than zero")
     args.ffmpeg = resolve_ffmpeg(args.ffmpeg)
-    if not args.dry_run and not ffmpeg_available(args.ffmpeg):
-        print(
-            f"FFmpeg was not found at '{args.ffmpeg}'. Exiting. Install FFmpeg or pass its path with --ffmpeg.",
-            file=sys.stderr,
-        )
-        return 2
+    if not args.dry_run and not Path(args.ffmpeg).is_file():
+        return fail(f"FFmpeg was not found at '{args.ffmpeg}'. Exiting. Install FFmpeg or pass its path with --ffmpeg.")
+    target_seconds = round(args.target_minutes * 60)
 
     spotify = spotipy.Spotify(
         auth_manager=spotipy.SpotifyClientCredentials(
@@ -173,66 +175,48 @@ def main() -> int:
             client_secret=os.environ["SPOTIPY_CLIENT_SECRET"],
         )
     )
-    playlist_key = playlist_id(args.playlist) if args.playlist else "__custom__"
-    if not args.playlist and extra_track_ids:
-        custom_seconds = 0
-        for track_id in extra_track_ids:
-            try:
-                custom_seconds += int(spotify.track(track_id).get("duration_ms") or 0) / 1000
-            except Exception as exc:
-                print(f"Could not read additional track {track_id}: {exc}", file=sys.stderr)
-        required_seconds = combo_count * args.target_minutes * 60
-        if custom_seconds >= required_seconds:
-            print("The custom songs cover all requested combos; no playlist is needed.")
-        else:
-            args.playlist = input("Spotify playlist link: ").strip()
-            if not args.playlist:
-                print("A playlist link is required.", file=sys.stderr)
-                return 2
-            playlist_key = playlist_id(args.playlist)
-    elif not args.playlist:
-        args.playlist = input("Spotify playlist link: ").strip()
-        if not args.playlist:
-            print("A playlist link is required.", file=sys.stderr)
-            return 2
+    custom_tracks = fetch_tracks(spotify, extra_track_ids)[:combo_count]
+    if args.playlist:
         playlist_key = playlist_id(args.playlist)
-    execution_combos = []
-    execution_used_ids = set()
-    log_directory = requested_output.parent if requested_output else Path("output")
-    log_path = log_directory / f"combo_log_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    elif custom_tracks and custom_songs_cover_combos(
+        [track.seconds for track in custom_tracks], combo_count, target_seconds
+    ):
+        print("The custom songs cover all requested combos; no playlist is needed.")
+        playlist_key = CUSTOM_ONLY_KEY
+    else:
+        link = input("Spotify playlist link: ").strip()
+        if not link:
+            return fail("A playlist link is required.")
+        playlist_key = playlist_id(link)
+    try:
+        tracks = [] if playlist_key == CUSTOM_ONLY_KEY else playlist_tracks(spotify, playlist_key)
+    except Exception as exc:
+        print(f"Could not read the playlist: {exc}", file=sys.stderr)
+        return 1
+
+    execution_combos: list[tuple[Path, list[Track]]] = []
+    execution_used_ids: set[str] = set()
+    log_path = (args.output.parent if args.output else OUTPUT_DIR) / f"combo_log_{datetime.now():%Y%m%d_%H%M%S}.txt"
     for combo_number in range(1, combo_count + 1):
-        if requested_output is None:
-            output = next_combo_path(Path("output"))
-        elif combo_count > 1:
-            output = requested_output.with_name(
-                f"{requested_output.stem}-{combo_number}{requested_output.suffix}"
-            )
-        else:
-            output = requested_output
+        output = combo_output_path(args.output, combo_number, combo_count)
         try:
-            tracks = create_combo(
-                spotify=spotify,
-                savify=None,
+            chosen = create_combo(
+                tracks=tracks,
                 playlist_id=playlist_key,
                 work_dir=args.work_dir,
-                output=output or next_combo_path(Path("output")),
+                output=output,
                 state_path=args.state,
-                target_seconds=round(args.target_minutes * 60),
+                target_seconds=target_seconds,
                 ffmpeg=args.ffmpeg,
                 cookies_from_browser=args.cookies_from_browser,
-                rng=random.Random(args.seed + combo_number - 1) if args.seed is not None else random.Random(),
+                rng=random.Random(None if args.seed is None else args.seed + combo_number - 1),
                 dry_run=args.dry_run,
-                extra_track_ids=extra_track_ids,
-                priority_track_id=(
-                    extra_track_ids[combo_number - 1]
-                    if combo_number <= len(extra_track_ids)
-                    else None
-                ),
+                priority_track=custom_tracks[combo_number - 1] if combo_number <= len(custom_tracks) else None,
                 execution_used_ids=execution_used_ids,
             )
             if not args.dry_run:
-                execution_used_ids.update(track.id for track in tracks)
-                execution_combos.append((output, tracks))
+                execution_used_ids.update(track.id for track in chosen)
+                execution_combos.append((output, chosen))
                 write_execution_log(log_path, execution_combos)
         except Exception as exc:
             print(f"Combo {combo_number} failed: {exc}", file=sys.stderr)

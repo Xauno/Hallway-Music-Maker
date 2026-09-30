@@ -6,3 +6,4 @@ __pycache__/
 .downloads/
 data/used_tracks.json
 output/
+.cache

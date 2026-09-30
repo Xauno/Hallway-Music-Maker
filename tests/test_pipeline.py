@@ -5,12 +5,15 @@ import subprocess
 from pathlib import Path
 from datetime import date
 
-from hallway_music_maker.cli import next_combo_path, resolve_ffmpeg
+from hallway_music_maker import pipeline
+from hallway_music_maker.cli import custom_songs_cover_combos, next_combo_path, resolve_ffmpeg
 from hallway_music_maker.pipeline import (
     Track,
     choose_tracks,
     concat_file_path,
+    create_combo,
     merge_mp3s,
+    playlist_tracks,
     prioritize_tracks,
     safe_filename,
 )
@@ -134,3 +137,82 @@ def test_next_combo_path_counts_only_the_requested_date(tmp_path: Path):
     (tmp_path / "08,17-9.mp3").touch()
 
     assert next_combo_path(tmp_path, date(2026, 8, 18)) == tmp_path / "08,18-4.mp3"
+
+
+def test_custom_songs_cover_combos_needs_one_long_song_per_combo():
+    # 12-minute combos need each assigned custom song to fill at least 10 minutes.
+    assert custom_songs_cover_combos([600, 700], 2, 720)
+    assert not custom_songs_cover_combos([300, 300, 300, 300], 2, 720)
+    assert not custom_songs_cover_combos([900], 2, 720)
+
+
+class FakeSpotify:
+    def __init__(self, tracks: list[Track]):
+        self.tracks = tracks
+
+    def playlist_items(self, playlist_id, fields=None, additional_types=None):
+        return {
+            "href": f"playlist/{playlist_id}",
+            "next": None,
+            "items": [
+                {"track": {"id": t.id, "name": t.name, "artists": [{"name": t.artists}], "uri": t.url, "duration_ms": t.duration_ms}}
+                for t in self.tracks
+            ],
+        }
+
+
+def test_reset_and_retry_finishes_when_refill_reaches_selection_target(tmp_path: Path, monkeypatch):
+    # 12-minute target selects until 10 minutes; only "c" is unused, so the user resets and "a" + "b" refill 10 minutes.
+    tracks = [track("a", 300_000), track("b", 300_000), track("c", 300_000)]
+    state_path = tmp_path / "used_tracks.json"
+    save_used_ids(state_path, "playlist", {"a", "b"})
+    output = tmp_path / "combo.mp3"
+    monkeypatch.setattr(pipeline, "download_track", lambda track, destination, *args: destination.write_bytes(b"mp3"))
+    monkeypatch.setattr(pipeline, "merge_mp3s", lambda files, out, *args: out.write_bytes(b"merged"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "2")
+
+    chosen = create_combo(
+        tracks=tracks,
+        playlist_id="playlist",
+        work_dir=tmp_path / "work",
+        output=output,
+        state_path=state_path,
+        target_seconds=720,
+        rng=random.Random(1),
+    )
+
+    assert {item.id for item in chosen} == {"a", "b"}
+    assert output.is_file()
+    assert load_used_ids(state_path, "playlist") == {"a", "b"}
+
+
+def test_playlist_tracks_skips_items_without_id_or_name():
+    tracks = [track("a"), track("", 1000), Track("b", "", "Artist", "spotify:track:b", 1000)]
+
+    assert playlist_tracks(FakeSpotify(tracks), "playlist") == [tracks[0]]
+
+
+def test_custom_track_already_in_playlist_is_downloaded_once(tmp_path: Path, monkeypatch):
+    tracks = [track("a", 300_000), track("b", 300_000), track("c", 300_000)]
+    downloaded = []
+
+    def fake_download(track, destination, *args):
+        downloaded.append(track.id)
+        destination.write_bytes(b"mp3")
+
+    monkeypatch.setattr(pipeline, "download_track", fake_download)
+    monkeypatch.setattr(pipeline, "merge_mp3s", lambda files, out, *args: out.write_bytes(b"merged"))
+
+    chosen = create_combo(
+        tracks=tracks,
+        playlist_id="playlist",
+        work_dir=tmp_path / "work",
+        output=tmp_path / "combo.mp3",
+        state_path=tmp_path / "used_tracks.json",
+        target_seconds=720,
+        rng=random.Random(1),
+        priority_track=tracks[1],
+    )
+
+    assert chosen[0].id == "b"
+    assert downloaded.count("b") == 1
