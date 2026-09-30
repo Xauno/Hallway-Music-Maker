@@ -1,7 +1,8 @@
-"""Spotify selection, Savify downloads, and FFmpeg assembly."""
+"""Spotify selection, yt-dlp downloads, and FFmpeg assembly."""
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import shutil
@@ -17,11 +18,35 @@ from yt_dlp import YoutubeDL
 from .state import load_used_ids, save_used_ids
 
 SELECTION_BUFFER_SECONDS = 120
+LOW_TRACK_WARNING = 10
+
+
+def resolve_ffmpeg(value: str) -> str:
+    resolved = shutil.which(value)
+    if resolved:
+        return str(Path(resolved).resolve())
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
+    if value == "ffmpeg":
+        package_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+        matches = sorted(package_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
+        if matches:
+            return str(matches[-1].resolve())
+        for candidate in (Path("/opt/homebrew/bin/ffmpeg"), Path("/usr/local/bin/ffmpeg")):
+            if candidate.is_file():
+                return str(candidate.resolve())
+    return value
 
 
 def concat_file_path(path: Path) -> str:
     escaped = path.resolve().as_posix().replace("\\", "\\\\").replace("'", "'\\''")
     return f"file '{escaped}'"
+
+
+def selection_target(target_seconds: float) -> float:
+    """Stop adding songs this far short of the target so a new song is not cut off right after it starts."""
+    return max(target_seconds - SELECTION_BUFFER_SECONDS, 1)
 
 
 @dataclass(frozen=True)
@@ -35,6 +60,28 @@ class Track:
     @property
     def label(self) -> str:
         return f"{self.artists} - {self.name}"
+
+    @property
+    def seconds(self) -> float:
+        return max(self.duration_ms / 1000, 1)
+
+
+def total_seconds(tracks: list[Track]) -> float:
+    return sum(track.seconds for track in tracks)
+
+
+def track_from_spotify(item: dict[str, Any] | None) -> Track | None:
+    item = item or {}
+    url = (item.get("external_urls") or {}).get("spotify") or item.get("uri")
+    if not item.get("id") or not item.get("name") or not url:
+        return None
+    return Track(
+        id=item["id"],
+        name=item["name"],
+        artists=", ".join(artist["name"] for artist in item.get("artists", [])),
+        url=url,
+        duration_ms=int(item.get("duration_ms") or 0),
+    )
 
 
 def safe_filename(value: str, max_length: int = 180) -> str:
@@ -73,30 +120,33 @@ def playlist_tracks(spotify: Any, playlist_id: str) -> list[Track]:
         if page_url:
             seen_pages.add(page_url)
         for item in results.get("items", []):
-            track = item.get("track") or {}
-            track_id = track.get("id")
-            if not track_id or not track.get("name"):
-                continue
-            url = (track.get("external_urls") or {}).get("spotify") or track.get("uri")
-            if not url:
-                continue
-            tracks.append(
-                Track(
-                    id=track_id,
-                    name=track["name"],
-                    artists=", ".join(artist["name"] for artist in track.get("artists", [])),
-                    url=url,
-                    duration_ms=int(track.get("duration_ms") or 0),
-                )
-            )
+            track = track_from_spotify(item.get("track"))
+            if track:
+                tracks.append(track)
         results = spotify.next(results) if results.get("next") else None
+    return tracks
+
+
+def fetch_tracks(spotify: Any, track_ids: list[str]) -> list[Track]:
+    """Look up individual Spotify tracks, skipping any that cannot be read."""
+    tracks: list[Track] = []
+    for track_id in track_ids:
+        try:
+            track = track_from_spotify(spotify.track(track_id))
+        except Exception as exc:
+            print(f"Skipping additional track {track_id}: {exc}")
+            continue
+        if track:
+            tracks.append(track)
+        else:
+            print(f"Skipping additional track {track_id}: Spotify returned incomplete track data")
     return tracks
 
 
 def choose_tracks(
     tracks: list[Track],
     used_ids: set[str],
-    target_seconds: int,
+    target_seconds: float,
     rng: random.Random,
     shuffle_tracks: bool = True,
 ) -> list[Track]:
@@ -104,15 +154,15 @@ def choose_tracks(
     if shuffle_tracks:
         rng.shuffle(available)
     chosen: list[Track] = []
-    total_seconds = 0
+    seconds = 0.0
     for track in available:
         chosen.append(track)
-        total_seconds += max(track.duration_ms / 1000, 1)
-        if total_seconds >= target_seconds:
+        seconds += track.seconds
+        if seconds >= target_seconds:
             return chosen
     raise RuntimeError(
         f"Only {len(available)} unused track(s) are available, but they do not cover "
-        f"the requested {target_seconds} seconds. Add more tracks or reset the used list."
+        f"the requested {target_seconds:g} seconds. Add more tracks or reset the used list."
     )
 
 
@@ -144,35 +194,15 @@ def merge_mp3s(files: list[Path], output: Path, target_seconds: int, ffmpeg: str
         suffix=".concat.txt",
         delete=False,
     ) as concat:
-        concat.write(
-            "\n".join(
-                concat_file_path(file) for file in files
-            )
-            + "\n"
-        )
+        concat.write("".join(f"{concat_file_path(file)}\n" for file in files))
         concat_file = Path(concat.name)
+    command = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-t", str(target_seconds), "-vn", "-codec:a", "libmp3lame", "-q:a", "2",
+        str(output),
+    ]
     try:
-        command = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-t",
-            str(target_seconds),
-            "-vn",
-            "-codec:a",
-            "libmp3lame",
-            "-q:a",
-            "2",
-            str(output),
-        ]
         subprocess.run(command, check=True)
     except FileNotFoundError as exc:
         raise RuntimeError("FFmpeg was not found. Install it and add it to PATH.") from exc
@@ -182,9 +212,40 @@ def merge_mp3s(files: list[Path], output: Path, target_seconds: int, ffmpeg: str
         concat_file.unlink(missing_ok=True)
 
 
+def download_until(
+    tracks: list[Track],
+    work_dir: Path,
+    target_seconds: float,
+    ffmpeg: str,
+    cookies_from_browser: str | None,
+) -> tuple[list[Track], list[Path]]:
+    """Download tracks in order, skipping failures, until they add up to target_seconds."""
+    chosen: list[Track] = []
+    downloads: list[Path] = []
+    seconds = 0.0
+    warned_low = False
+    for index, track in enumerate(tracks, start=1):
+        remaining = len(tracks) - index
+        if remaining < LOW_TRACK_WARNING and not warned_low:
+            print(f"Warning: fewer than {LOW_TRACK_WARNING} unused songs remain ({remaining}).")
+            warned_low = True
+        print(f"Downloading {index}/{len(tracks)}: {track.label}")
+        destination = download_path(work_dir, index, track)
+        try:
+            download_track(track, destination, ffmpeg, cookies_from_browser)
+        except (OSError, RuntimeError) as exc:
+            print(f"Skipping {track.label}: {exc}")
+            continue
+        chosen.append(track)
+        downloads.append(destination)
+        seconds += track.seconds
+        if seconds >= target_seconds:
+            break
+    return chosen, downloads
+
+
 def create_combo(
-    spotify: Any,
-    savify: Any | None,
+    tracks: list[Track],
     playlist_id: str,
     work_dir: Path,
     output: Path,
@@ -194,111 +255,42 @@ def create_combo(
     cookies_from_browser: str | None = None,
     rng: random.Random | None = None,
     dry_run: bool = False,
-    extra_track_ids: list[str] | None = None,
-    priority_track_id: str | None = None,
+    priority_track: Track | None = None,
     execution_used_ids: set[str] | None = None,
 ) -> list[Track]:
+    """Build one combo from the playlist's tracks, with an optional custom track placed first.
+
+    execution_used_ids holds tracks already used during this run; it is updated if the playlist is reset.
+    """
     rng = rng or random.Random()
     if execution_used_ids is None:
         execution_used_ids = set()
-    all_tracks = [] if playlist_id == "__custom__" else playlist_tracks(spotify, playlist_id)
-    extra_tracks: list[Track] = []
-    for track_id in extra_track_ids or []:
-        try:
-            item = spotify.track(track_id)
-            extra_tracks.append(
-                Track(
-                    id=item["id"],
-                    name=item["name"],
-                    artists=", ".join(artist["name"] for artist in item.get("artists", [])),
-                    url=(item.get("external_urls") or {}).get("spotify") or item.get("uri", ""),
-                    duration_ms=int(item.get("duration_ms") or 0),
-                )
-            )
-        except Exception as exc:
-            print(f"Skipping additional track {track_id}: {exc}")
-    extra_ids = {track.id for track in extra_tracks}
-    selected_extra_ids = {priority_track_id} if priority_track_id in extra_ids else set()
-    all_tracks.extend(track for track in extra_tracks if track.id in selected_extra_ids)
-    priority_ids = selected_extra_ids
+    candidates = tracks
+    priority_ids: set[str] = set()
+    if priority_track:
+        candidates = [priority_track, *(track for track in tracks if track.id != priority_track.id)]
+        priority_ids = {priority_track.id}
+    target = selection_target(target_seconds)
+    used_ids = load_used_ids(state_path, playlist_id)
+
+    def ordered(excluded_ids: set[str]) -> list[Track]:
+        # The assigned custom track is always allowed, even if it was used before.
+        return prioritize_tracks(candidates, excluded_ids - priority_ids, priority_ids, rng)
+
     if dry_run:
-        used_ids = (load_used_ids(state_path, playlist_id) | execution_used_ids) - priority_ids
-        ordered_tracks = prioritize_tracks(all_tracks, used_ids, priority_ids, rng)
-        chosen = choose_tracks(
-            ordered_tracks,
-            set(),
-            max(target_seconds - SELECTION_BUFFER_SECONDS, 1),
-            rng,
-            shuffle_tracks=False,
-        )
+        chosen = choose_tracks(ordered(used_ids | execution_used_ids), set(), target, rng, shuffle_tracks=False)
         print("Selected tracks:")
         for track in chosen:
             print(f"  - {track.label}")
         return chosen
+
     work_dir.mkdir(parents=True, exist_ok=True)
     combo_work_dir = Path(tempfile.mkdtemp(prefix=f".{output.stem}.", dir=work_dir))
-    downloads: list[Path] = []
-    chosen: list[Track] = []
-    total_seconds = 0.0
-    selection_target_seconds = max(target_seconds - SELECTION_BUFFER_SECONDS, 1)
-    used_ids = load_used_ids(state_path, playlist_id)
-    available = prioritize_tracks(
-        all_tracks,
-        (used_ids | execution_used_ids) - priority_ids,
-        priority_ids,
-        rng,
-    )
-    warned_low = False
-    attempted_until = 0
     try:
-        for index, track in enumerate(available, start=1):
-            attempted_until = index
-            remaining = len(available) - index
-            if remaining < 10 and not warned_low:
-                print(f"Warning: fewer than 10 unused songs remain ({remaining}).")
-                warned_low = True
-            print(f"Downloading {index}/{len(available)}: {track.label}")
-            try:
-                destination = download_path(combo_work_dir, index, track)
-                download_track(track, destination, ffmpeg, cookies_from_browser)
-            except (OSError, RuntimeError) as exc:
-                print(f"Skipping {track.label}: {exc}")
-                continue
-            if not destination.is_file() or destination.stat().st_size == 0:
-                print(f"Skipping {track.label}: download file was not created")
-                continue
-            downloads.append(destination)
-            chosen.append(track)
-            total_seconds += max(track.duration_ms / 1000, 1)
-            if total_seconds >= selection_target_seconds:
-                break
-        valid_pairs = [
-            (track, download)
-            for track, download in zip(chosen, downloads)
-            if download.is_file() and download.stat().st_size > 0
-        ]
-        if len(valid_pairs) != len(downloads):
-            print("A downloaded file disappeared before merging; trying replacement songs.")
-            chosen = [track for track, _ in valid_pairs]
-            downloads = [download for _, download in valid_pairs]
-            total_seconds = sum(max(track.duration_ms / 1000, 1) for track in chosen)
-            for index, track in enumerate(available[attempted_until:], start=attempted_until + 1):
-                print(f"Downloading replacement {index}/{len(available)}: {track.label}")
-                try:
-                    destination = download_path(combo_work_dir, index, track)
-                    download_track(track, destination, ffmpeg, cookies_from_browser)
-                except (OSError, RuntimeError) as exc:
-                    print(f"Skipping {track.label}: {exc}")
-                    continue
-                if not destination.is_file() or destination.stat().st_size == 0:
-                    print(f"Skipping {track.label}: download file was not created")
-                    continue
-                downloads.append(destination)
-                chosen.append(track)
-                total_seconds += max(track.duration_ms / 1000, 1)
-                if total_seconds >= selection_target_seconds:
-                    break
-        if total_seconds < selection_target_seconds:
+        chosen, downloads = download_until(
+            ordered(used_ids | execution_used_ids), combo_work_dir, target, ffmpeg, cookies_from_browser
+        )
+        if total_seconds(chosen) < target:
             print("No unused songs remain in this playlist.")
             choice = input(
                 "Enter 1 to combine what was downloaded and finish, or "
@@ -308,42 +300,11 @@ def create_combo(
                 execution_used_ids.update(track.id for track in chosen)
                 save_used_ids(state_path, playlist_id, set())
                 used_ids = set()
-                for download in downloads:
-                    download.unlink(missing_ok=True)
-                downloads.clear()
-                chosen.clear()
-                total_seconds = 0.0
-                available = prioritize_tracks(
-                    all_tracks,
-                    execution_used_ids - priority_ids,
-                    priority_ids,
-                    rng,
+                chosen, downloads = download_until(
+                    ordered(execution_used_ids), combo_work_dir, target, ffmpeg, cookies_from_browser
                 )
-                warned_low = False
-                for index, track in enumerate(available, start=1):
-                    remaining = len(available) - index
-                    if remaining < 10 and not warned_low:
-                        print(f"Warning: fewer than 10 unused songs remain ({remaining}).")
-                        warned_low = True
-                    print(f"Downloading {index}/{len(available)}: {track.label}")
-                    try:
-                        destination = download_path(combo_work_dir, index, track)
-                        download_track(track, destination, ffmpeg, cookies_from_browser)
-                    except (OSError, RuntimeError) as exc:
-                        print(f"Skipping {track.label}: {exc}")
-                        continue
-                    if not destination.is_file() or destination.stat().st_size == 0:
-                        print(f"Skipping {track.label}: download file was not created")
-                        continue
-                    downloads.append(destination)
-                    chosen.append(track)
-                    total_seconds += max(track.duration_ms / 1000, 1)
-                    if total_seconds >= selection_target_seconds:
-                        break
-                if total_seconds < target_seconds:
-                    raise RuntimeError(
-                        "The playlist has no additional songs available during this execution."
-                    )
+                if total_seconds(chosen) < target:
+                    raise RuntimeError("The playlist has no additional songs available during this execution.")
             elif not downloads:
                 raise RuntimeError("No downloaded songs remain to combine.")
         merge_mp3s(downloads, output, target_seconds, ffmpeg)
@@ -351,8 +312,6 @@ def create_combo(
         print(f"Created {output}")
         return chosen
     finally:
-        for download in downloads:
-            download.unlink(missing_ok=True)
         shutil.rmtree(combo_work_dir, ignore_errors=True)
 
 
@@ -364,27 +323,9 @@ def download_track(
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.unlink(missing_ok=True)
-    resolved = shutil.which(ffmpeg)
-    if resolved:
-        ffmpeg = str(Path(resolved).resolve())
-    elif Path(ffmpeg).is_file():
-        ffmpeg = str(Path(ffmpeg).resolve())
-    elif ffmpeg == "ffmpeg":
-        package_root = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
-        matches = sorted(package_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
-        if matches:
-            ffmpeg = str(matches[-1].resolve())
-        else:
-            for candidate in (Path("/opt/homebrew/bin/ffmpeg"), Path("/usr/local/bin/ffmpeg")):
-                if candidate.is_file():
-                    ffmpeg = str(candidate.resolve())
-                    break
-    if not Path(ffmpeg).is_file() and not shutil.which(ffmpeg):
-        raise RuntimeError(f"FFmpeg was not found at '{ffmpeg}'. Exiting.")
-    template = str(destination.with_suffix("")) + ".%(ext)s"
     options = {
         "format": "140/251/bestaudio/best",
-        "outtmpl": template,
+        "outtmpl": str(destination.with_suffix("")) + ".%(ext)s",
         "noplaylist": True,
         "quiet": False,
         "no_warnings": False,

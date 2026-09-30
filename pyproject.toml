@@ -13,6 +13,9 @@ dependencies = [
     "yt-dlp>=2025.1.15",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 hallway-music-maker = "hallway_music_maker.cli:main"
 
