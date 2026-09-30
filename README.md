@@ -86,6 +86,10 @@ Output files are named automatically as `output/MM,DD-N.mp3`, where `N` is the n
 
 On Windows, you can also double-click `run-hallway-music-maker.bat`. It activates `.venv`, runs the tool in interactive mode, and keeps the window open when the tool finishes.
 
+On macOS, double-click `run-hallway-music-maker.command` in Finder. It does the same thing in Terminal. (The first time, macOS may block it; right-click it and choose **Open**.)
+
+When the run finishes, the output folder opens in Finder or File Explorer. Pass `--no-open` to skip this.
+
 #### Custom songs
 
 - The app shuffles the custom songs once, gives each combo one of them, and plays that combo's song first.
@@ -132,6 +136,7 @@ hallway-music-maker --playlist all --reset-used
 | `--dry-run` | off | Print the selection only. Nothing is downloaded or saved. |
 | `--seed` | random | Makes the selection reproducible. Combo *n* uses `seed + n − 1`. |
 | `--reset-used` | off | Clear the used list for `--playlist`, then exit. |
+| `--no-open` | off | Don't open the output folder when the run finishes. |
 
 When you pass `--playlist` (or `--dry-run`), the app makes a single combo and doesn't ask about custom songs.
 

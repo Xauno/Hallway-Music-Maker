@@ -7,6 +7,7 @@ from datetime import date, datetime
 import os
 import random
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -71,6 +72,19 @@ def write_execution_log(path: Path, combos: list[tuple[Path, list[Track]]]) -> N
     path.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
 
 
+def open_folder(path: Path) -> None:
+    """Show the folder in Finder / File Explorer; failure here should never fail the run."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except OSError as exc:
+        print(f"Could not open {path}: {exc}", file=sys.stderr)
+
+
 def ask_yes(prompt: str) -> bool:
     return input(prompt).strip().lower() in {"y", "yes"}
 
@@ -126,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Clear the used-track list for --playlist and exit",
     )
+    parser.add_argument("--no-open", action="store_true", help="Don't open the output folder when finished")
     return parser
 
 
@@ -221,6 +236,8 @@ def main() -> int:
         except Exception as exc:
             print(f"Combo {combo_number} failed: {exc}", file=sys.stderr)
             return 1
+    if execution_combos and not args.no_open:
+        open_folder(execution_combos[-1][0].parent.resolve())
     return 0
 
 
